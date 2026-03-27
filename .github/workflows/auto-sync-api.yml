@@ -2,7 +2,7 @@ name: Auto Sync Fork
 
 on:
   schedule:
-    - cron: '*/15 * * * *'
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -12,23 +12,87 @@ jobs:
       contents: write
     
     steps:
-      - name: Sync with shallow clone
+      - name: Sync new manifest files
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "bot@github.com"
+          echo "=== Starting sync at $(date) ==="
           
-          # 浅克隆原仓库
-          git clone --depth=1 https://github.com/qwe213312/k25FCdfEOoEJ42S6.git upstream
+          # 获取原仓库的所有 .manifest 文件路径
+          echo "Fetching upstream file list..."
+          curl -s "https://api.github.com/repos/qwe213312/k25FCdfEOoEJ42S6/git/trees/main?recursive=1" \
+            -H "Accept: application/vnd.github.v3+json" > tree.json
           
-          # 浅克隆你的仓库
-          git clone --depth=1 https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git fork
+          # 提取 .manifest 文件路径
+          cat tree.json | grep -o '"path":"[^"]*\.manifest"' | sed 's/"path":"//g' | sed 's/"//g' > upstream_files.txt
           
-          # 复制文件
-          cp -r upstream/* fork/ 2>/dev/null || true
-          cp -r upstream/.git* fork/ 2>/dev/null || true
+          UP_COUNT=$(wc -l < upstream_files.txt)
+          echo "Found $UP_COUNT .manifest files in upstream"
           
-          # 提交并推送
-          cd fork
-          git add .
-          git diff --cached --quiet || git commit -m "Auto sync $(date)"
-          git push origin main --force
+          # 获取你仓库现有的 .manifest 文件
+          echo "Fetching your fork file list..."
+          curl -s "https://api.github.com/repos/${{ github.repository }}/contents/" \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" > fork_contents.json
+          
+          cat fork_contents.json | grep -o '"name":"[^"]*\.manifest"' | sed 's/"name":"//g' | sed 's/"//g' > fork_files.txt
+          
+          FORK_COUNT=$(wc -l < fork_files.txt)
+          echo "Found $FORK_COUNT .manifest files in your fork"
+          
+          # 找出新文件（用 comm 命令）
+          sort upstream_files.txt > upstream_sorted.txt
+          sort fork_files.txt > fork_sorted.txt
+          comm -23 upstream_sorted.txt fork_sorted.txt > new_files.txt
+          
+          NEW_COUNT=$(wc -l < new_files.txt)
+          echo "New files to sync: $NEW_COUNT"
+          
+          if [ "$NEW_COUNT" -eq 0 ]; then
+            echo "✅ Already up to date"
+            exit 0
+          fi
+          
+          # 显示新文件列表
+          echo "New files:"
+          head -10 new_files.txt
+          
+          # 逐个同步
+          SUCCESS=0
+          FAIL=0
+          
+          while read file; do
+            [ -z "$file" ] && continue
+            
+            echo "Syncing: $file"
+            
+            # 下载文件内容
+            curl -s -L "https://raw.githubusercontent.com/qwe213312/k25FCdfEOoEJ42S6/main/$file" -o /tmp/file_content
+            
+            # Base64 编码（兼容 Linux 和 macOS）
+            if command -v base64 &> /dev/null; then
+              CONTENT=$(cat /tmp/file_content | base64 -w 0 2>/dev/null || cat /tmp/file_content | base64)
+            else
+              CONTENT=$(cat /tmp/file_content | openssl base64 -A)
+            fi
+            
+            # 上传到你的仓库
+            RESPONSE=$(curl -s -X PUT \
+              "https://api.github.com/repos/${{ github.repository }}/contents/$file" \
+              -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+              -H "Accept: application/vnd.github.v3+json" \
+              -d "{\"message\":\"Sync $file\",\"content\":\"$CONTENT\"}")
+            
+            if echo "$RESPONSE" | grep -q '"content"'; then
+              echo "  ✅ Success"
+              SUCCESS=$((SUCCESS + 1))
+            else
+              echo "  ❌ Failed: $RESPONSE"
+              FAIL=$((FAIL + 1))
+            fi
+            
+            rm -f /tmp/file_content
+          done < new_files.txt
+          
+          echo "================================"
+          echo "Sync completed: $SUCCESS new files"
+          echo "Total upstream: $UP_COUNT | Your fork: $((FORK_COUNT + SUCCESS))"
+          echo "================================"
