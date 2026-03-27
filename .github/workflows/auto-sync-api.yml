@@ -2,7 +2,7 @@ name: Auto Sync Fork
 
 on:
   schedule:
-    - cron: '*/10 * * * *'   # 每10分钟
+    - cron: '*/10 * * * *'
   workflow_dispatch:
 
 jobs:
@@ -12,77 +12,88 @@ jobs:
       contents: write
     
     steps:
-      - name: Get upstream file list
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Sync new files
         run: |
-          echo "Fetching file list from upstream..."
+          set -e
+          
+          echo "Starting sync at $(date)"
+          
+          # 获取原仓库最新文件列表
+          echo "Fetching upstream file list..."
           curl -s "https://api.github.com/repos/qwe213312/k25FCdfEOoEJ42S6/git/trees/main?recursive=1" \
-            -H "Accept: application/vnd.github.v3+json" \
-            | jq -r '.tree[] | select(.type == "blob") | .path' > upstream_files.txt
+            -H "Accept: application/vnd.github.v3+json" > upstream_tree.json
           
-          UPSTREAM_COUNT=$(wc -l < upstream_files.txt)
-          echo "Upstream has $UPSTREAM_COUNT files"
-          echo "UPSTREAM_COUNT=$UPSTREAM_COUNT" >> $GITHUB_ENV
-      
-      - name: Get your fork file list
-        run: |
-          curl -s "https://api.github.com/repos/${{ github.repository }}/git/trees/main?recursive=1" \
+          # 提取文件路径（只取 .manifest 文件）
+          cat upstream_tree.json | jq -r '.tree[] | select(.type == "blob") | .path' | grep '\.manifest$' > upstream_files.txt || true
+          
+          UP_COUNT=$(cat upstream_files.txt | wc -l)
+          echo "Upstream manifest files: $UP_COUNT"
+          
+          # 获取你仓库的现有文件列表
+          echo "Fetching your fork file list..."
+          curl -s "https://api.github.com/repos/${{ github.repository }}/contents/" \
             -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            | jq -r '.tree[] | select(.type == "blob") | .path' > fork_files.txt
+            -H "Accept: application/vnd.github.v3+json" | jq -r '.[] | .name' | grep '\.manifest$' > fork_files.txt || true
           
-          FORK_COUNT=$(wc -l < fork_files.txt)
-          echo "Your fork has $FORK_COUNT files"
-          echo "FORK_COUNT=$FORK_COUNT" >> $GITHUB_ENV
-      
-      - name: Find and sync new files
-        run: |
-          # 找出 upstream 有但 fork 没有的文件
-          comm -23 <(sort upstream_files.txt) <(sort fork_files.txt) > new_files.txt
+          FORK_COUNT=$(cat fork_files.txt | wc -l)
+          echo "Your fork manifest files: $FORK_COUNT"
           
-          NEW_COUNT=$(wc -l < new_files.txt)
-          echo "Found $NEW_COUNT new files to sync"
+          # 找出新文件
+          comm -23 upstream_files.txt fork_files.txt > new_files.txt || true
           
-          if [ $NEW_COUNT -eq 0 ]; then
+          NEW_COUNT=$(cat new_files.txt | wc -l)
+          echo "New files to sync: $NEW_COUNT"
+          
+          if [ "$NEW_COUNT" -eq 0 ]; then
             echo "✅ Already up to date"
             exit 0
           fi
           
-          # 显示前10个新文件
-          echo "New files (first 10):"
-          head -10 new_files.txt
+          # 显示前5个新文件
+          echo "New files:"
+          head -5 new_files.txt
           
-          # 逐个上传新文件
+          # 同步新文件
           SUCCESS=0
-          FAIL=0
-          
           while IFS= read -r file; do
             if [ -z "$file" ]; then continue; fi
             
             echo "Syncing: $file"
             
-            # 获取文件内容并 base64
-            content=$(curl -s "https://raw.githubusercontent.com/qwe213312/k25FCdfEOoEJ42S6/main/$file" | base64 -w0)
+            # 下载文件内容
+            curl -s -L "https://raw.githubusercontent.com/qwe213312/k25FCdfEOoEJ42S6/main/$file" -o temp_file
+            
+            # 获取文件大小
+            SIZE=$(stat -c%s temp_file 2>/dev/null || stat -f%z temp_file 2>/dev/null || echo "0")
+            echo "  File size: $SIZE bytes"
             
             # 上传到你的仓库
-            response=$(curl -s -X PUT \
+            CONTENT=$(cat temp_file | base64 -w0 2>/dev/null || cat temp_file | base64)
+            
+            curl -s -X PUT \
               "https://api.github.com/repos/${{ github.repository }}/contents/$file" \
               -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
               -H "Accept: application/vnd.github.v3+json" \
-              -d "{\"message\":\"Sync new file: $file\",\"content\":\"$content\"}")
+              -d "{\"message\":\"Auto sync: $file\",\"content\":\"$CONTENT\"}" > response.json
             
-            if echo "$response" | grep -q '"content"'; then
-              echo "  ✅ $file synced"
+            if cat response.json | grep -q '"content"'; then
+              echo "  ✅ Success"
               SUCCESS=$((SUCCESS + 1))
             else
-              echo "  ❌ $file failed"
-              FAIL=$((FAIL + 1))
+              echo "  ❌ Failed"
+              cat response.json
             fi
+            
+            rm -f temp_file
           done < new_files.txt
           
-          echo "========== Summary =========="
-          echo "New files found: $NEW_COUNT"
-          echo "Successfully synced: $SUCCESS"
-          echo "Failed: $FAIL"
-          echo "Upstream total: $UPSTREAM_COUNT"
-          echo "Your fork total: $FORK_COUNT"
-          echo "============================="
+          echo "================================"
+          echo "Sync completed: $SUCCESS / $NEW_COUNT files"
+          echo "Upstream: $UP_COUNT | Your fork: $((FORK_COUNT + SUCCESS))"
+          echo "================================"
