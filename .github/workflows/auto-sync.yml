@@ -1,0 +1,36 @@
+name: Auto Sync Fork
+
+on:
+  schedule:
+    - cron: '*/15 * * * *'   # 每15分钟自动同步一次
+  workflow_dispatch:          # 保留手动触发按钮
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    
+    steps:
+      - name: Checkout your fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Sync with upstream
+        run: |
+          # 添加原仓库为 upstream
+          git remote add upstream https://github.com/qwe213312/k25FCdfEOoEJ42S6.git
+          
+          # 获取原仓库最新状态
+          git fetch upstream main
+          
+          # 切换到你的 main 分支
+          git checkout main
+          
+          # 合并更新（只做快进合并，不产生额外 merge commit）
+          git merge upstream/main --ff-only
+          
+          # 推送到你的仓库
+          git push origin main
